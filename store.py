@@ -18,6 +18,7 @@ FIELD_DEFAULTS = {
     "due": None,         # срок выполнения, "YYYY-MM-DD"
     "remind": None,      # время напоминания (локальное), "YYYY-MM-DD HH:MM"
     "reminded": False,   # напоминание уже показано
+    "failed": False,     # закрыта как проваленная (при этом done=True)
 }
 
 DATE_FMT = "%d.%m.%Y"
@@ -109,6 +110,78 @@ def due_status(t: dict, today: date | None = None) -> str | None:
     if t["due"] == today:
         return "today"
     return None
+
+
+MONTHS = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+          "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
+
+
+def period_range(kind: str, offset: int = 0, today: date | None = None):
+    """Границы периода для отчёта: (начало, конец включительно, подпись).
+    kind: day | week | month | year | all; offset — сдвиг в периодах (-1 = предыдущий).
+    Для 'all' границы None."""
+    today = today or date.today()
+    if kind == "day":
+        d = today + timedelta(days=offset)
+        label = d.strftime(DATE_FMT) + (" (сегодня)" if offset == 0 else "")
+        return d, d, label
+    if kind == "week":
+        start = today - timedelta(days=today.weekday()) + timedelta(weeks=offset)
+        end = start + timedelta(days=6)
+        label = f"{start:%d.%m} – {end:%d.%m.%Y}" + (" (эта неделя)" if offset == 0 else "")
+        return start, end, label
+    if kind == "month":
+        y, m0 = divmod(today.year * 12 + today.month - 1 + offset, 12)
+        start = date(y, m0 + 1, 1)
+        end = date(y + (m0 == 11), (m0 + 1) % 12 + 1, 1) - timedelta(days=1)
+        return start, end, f"{MONTHS[m0]} {y}"
+    if kind == "year":
+        y = today.year + offset
+        return date(y, 1, 1), date(y, 12, 31), f"{y} год"
+    if kind == "all":
+        return None, None, "За всё время"
+    raise ValueError(f"Неизвестный период: {kind}")
+
+
+def task_ref_date(t: dict) -> date:
+    """К какому периоду относится задача: по дедлайну; если его нет — по дате закрытия
+    (для закрытых) или по дате создания (для открытых)."""
+    if t.get("due"):
+        return date.fromisoformat(t["due"])
+    src = t["done_at"] if t["done"] and t.get("done_at") else t["created"]
+    return datetime.fromisoformat(src).astimezone().date()
+
+
+def compute_report(tasks, start, end, include_subtasks=False, today: date | None = None) -> dict:
+    """Статистика по задачам периода [start, end] (None = без границы).
+    Статусы: выполнена (done и не failed), провалена (failed), в работе (остальные)."""
+    today = today or date.today()
+    res = {
+        "total": 0, "done": 0, "failed": 0, "open": 0, "overdue": 0,
+        "by_category": {k: {"total": 0, "done": 0, "failed": 0, "open": 0} for k in CATEGORIES},
+        "failed_tasks": [],
+    }
+    for t in tasks:
+        if t["deleted"] or (t["parent_id"] and not include_subtasks):
+            continue
+        ref = task_ref_date(t)
+        if (start is not None and ref < start) or (end is not None and ref > end):
+            continue
+        status = "failed" if t.get("failed") else ("done" if t["done"] else "open")
+        res["total"] += 1
+        res[status] += 1
+        cat = res["by_category"].get(t["category"])
+        if cat is not None:
+            cat["total"] += 1
+            cat[status] += 1
+        if status == "open" and due_status(t, today) == "overdue":
+            res["overdue"] += 1
+        if status == "failed":
+            res["failed_tasks"].append(t)
+    res["failed_tasks"].sort(key=task_ref_date)
+    closed = res["done"] + res["failed"]
+    res["success_rate"] = round(100 * res["done"] / closed) if closed else None
+    return res
 
 
 def merge_tasks(local: dict, remote: dict) -> dict:
@@ -282,7 +355,19 @@ class TaskStore:
     def set_done(self, tid, done, report=None):
         t = self.tasks[tid]
         t["done"] = done
+        t["failed"] = False  # «выполнена» и «вернуть в работу» снимают пометку о провале
         t["done_at"] = now_iso() if done else None
+        if report is not None:
+            t["report"] = report
+        self._touch(t)
+        self.save()
+
+    def set_failed(self, tid, report=None):
+        """Закрывает задачу как проваленную (причину можно записать в отчёт)."""
+        t = self.tasks[tid]
+        t["done"] = True
+        t["failed"] = True
+        t["done_at"] = now_iso()
         if report is not None:
             t["report"] = report
         self._touch(t)

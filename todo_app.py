@@ -17,8 +17,8 @@ from tkinter import messagebox, simpledialog, ttk
 
 import gdrive_sync
 from tray import Tray
-from store import (CATEGORIES, REMIND_FMT, TaskStore, due_status, fmt_date, fmt_remind,
-                   merge_tasks, parse_date, parse_datetime)
+from store import (CATEGORIES, REMIND_FMT, TaskStore, compute_report, due_status, fmt_date,
+                   fmt_remind, merge_tasks, parse_date, parse_datetime, period_range)
 
 DATA_DIR = Path(os.environ.get("TODO_APP_DIR", Path.home() / ".todo_app"))
 APP_DIR = Path(__file__).resolve().parent
@@ -32,13 +32,14 @@ SETTINGS_PATH = DATA_DIR / "settings.json"
 MIN_FONT, MAX_FONT = 8, 32
 STD_FONTS = ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont", "TkCaptionFont")
 THEME_CHOICES = (("Как в системе", "system"), ("Светлая", "light"), ("Тёмная", "dark"))
+STATS_KINDS = (("День", "day"), ("Неделя", "week"), ("Месяц", "month"), ("Год", "year"), ("Всё время", "all"))
 THEMES = {
     "light": dict(bg="#f5f5f7", fg="#1c1c1e", field="#ffffff", sel_bg="#2563eb", sel_fg="#ffffff",
                   muted="#666666", border="#c8c8cc", button="#e6e6ea", button_active="#d8d8de",
-                  done="#8a8a8a", overdue="#c0392b", today="#b9770e"),
+                  done="#8a8a8a", overdue="#c0392b", today="#b9770e", ok="#2e8b57"),
     "dark": dict(bg="#1e1f22", fg="#e6e6e6", field="#2b2d30", sel_bg="#3b6fd8", sel_fg="#ffffff",
                  muted="#9a9a9a", border="#43454a", button="#35373b", button_active="#43454a",
-                 done="#7d7d7d", overdue="#ff7b72", today="#e3b341"),
+                 done="#7d7d7d", overdue="#ff7b72", today="#e3b341", ok="#3fb950"),
 }
 
 
@@ -95,6 +96,7 @@ class App:
 
         self.settings = load_settings()
         self._view_win = None
+        self._stats_win = None
         self._native_theme = ttk.Style(root).theme_use()
         self._init_fonts()
 
@@ -117,6 +119,7 @@ class App:
 
         ttk.Button(top, text="Выход", command=self.quit_app).pack(side="right", padx=(6, 0))
         ttk.Button(top, text="Вид", command=self.open_view_settings).pack(side="right", padx=(6, 0))
+        ttk.Button(top, text="📊 Отчёт", command=self.open_stats).pack(side="right", padx=(6, 0))
         if self.tray.available:
             ttk.Button(top, text="В трей", command=self.hide_to_tray).pack(side="right", padx=(6, 0))
         self.sync_btn = ttk.Button(top, text="⟳ Синхронизировать", command=self.do_sync)
@@ -158,6 +161,7 @@ class App:
             tree.tag_configure("done", font=self.done_font, foreground="#8a8a8a")
             tree.tag_configure("overdue", foreground="#c0392b")
             tree.tag_configure("duetoday", foreground="#b9770e")
+            tree.tag_configure("failed", foreground="#c0392b")
             tree.bind("<<TreeviewSelect>>", self.on_select)
             for seq in ("<Button-3>", "<Button-2>", "<Control-Button-1>"):  # правая кнопка (Windows/Linux/macOS)
                 tree.bind(seq, self.on_tree_context)
@@ -195,6 +199,8 @@ class App:
         self.cat_box.bind("<<ComboboxSelected>>", lambda e: self.on_category_selected())
         self.done_btn = ttk.Button(row, text="✔ Завершить", command=self.toggle_done)
         self.done_btn.pack(side="right")
+        self.fail_btn = ttk.Button(row, text="✘ Провалена", command=self.mark_failed)
+        self.fail_btn.pack(side="right", padx=(0, 6))
 
         # дедлайн
         drow = ttk.Frame(right)
@@ -233,7 +239,7 @@ class App:
         self.desc = tk.Text(right, height=7, wrap="word", undo=True)
         self.desc.grid(row=6, column=0, columnspan=2, sticky="nsew")
 
-        ttk.Label(right, text="Отчёт о завершении").grid(row=7, column=0, sticky="w", pady=(10, 2))
+        ttk.Label(right, text="Отчёт (итог или причина провала)").grid(row=7, column=0, sticky="w", pady=(10, 2))
         self.report = tk.Text(right, height=5, wrap="word", undo=True)
         self.report.grid(row=8, column=0, columnspan=2, sticky="nsew")
 
@@ -343,6 +349,7 @@ class App:
             tree.tag_configure("done", font=self.done_font, foreground=pal["done"])
             tree.tag_configure("overdue", foreground=pal["overdue"])
             tree.tag_configure("duetoday", foreground=pal["today"])
+            tree.tag_configure("failed", foreground=pal["overdue"])
         self.meta_label.configure(foreground=pal["muted"])
         self.status.configure(foreground=pal["muted"])
         try:
@@ -350,6 +357,10 @@ class App:
                 self._view_win.configure(bg=pal["bg"])
         except tk.TclError:
             pass
+        if self._stats_alive():
+            self._stats_win.configure(bg=pal["bg"])
+            self._stats_bar.configure(bg=pal["bg"])
+            self._render_stats()
 
     @staticmethod
     def _style_clam(style, p):
@@ -471,11 +482,12 @@ class App:
             label = f"{CATEGORIES[key]} ({left})" + (f" ⚠{overdue}" if overdue else "")
             self.nb.tab(i, text=label)
         self._loading = False
+        self._render_stats()  # если окно отчёта открыто — обновить цифры
 
     def _insert(self, tree, parent, t):
         if self._visible is not None and t["id"] not in self._visible:
             return
-        text = ("✔ " if t["done"] else "○ ") + t["title"]
+        text = self._mark(t) + t["title"]
         if t["due"]:
             text += f"   📅 {short_date(t['due'])}"
         if t["remind"] and not t["reminded"] and not t["done"]:
@@ -483,10 +495,19 @@ class App:
         if t["links"]:
             text += "   🔗"
         status = due_status(t)
-        tag = "done" if t["done"] else {"overdue": "overdue", "today": "duetoday"}.get(status)
+        if t["failed"]:
+            tag = "failed"
+        elif t["done"]:
+            tag = "done"
+        else:
+            tag = {"overdue": "overdue", "today": "duetoday"}.get(status)
         tree.insert(parent, "end", iid=t["id"], text=text, open=True, tags=(tag,) if tag else ())
         for c in self.store.children(t["id"]):
             self._insert(tree, t["id"], c)
+
+    @staticmethod
+    def _mark(t):
+        return "✘ " if t["failed"] else ("✔ " if t["done"] else "○ ")
 
     def goto(self, tid, clear_filter=True):
         t = self.store.get(tid)
@@ -537,7 +558,7 @@ class App:
         for w in (self.title_entry, self.desc, self.report, self.due_entry, self.remind_entry):
             w.configure(state=st)
         self.cat_box.configure(state="readonly" if enabled else "disabled")
-        for b in (self.done_btn, self.save_btn, self.link_add_btn, self.link_del_btn,
+        for b in (self.done_btn, self.fail_btn, self.save_btn, self.link_add_btn, self.link_del_btn,
                   *self.due_btns, *self.remind_btns):
             b.configure(state=st)
 
@@ -561,7 +582,9 @@ class App:
             return
         self.cat_var.set(CATEGORIES[t["category"]])
         meta = f"Создана: {fmt_dt(t['created'])}"
-        if t["done"]:
+        if t["failed"]:
+            meta += f"   ·   ✘ Провалена: {fmt_dt(t['done_at'])}"
+        elif t["done"]:
             meta += f"   ·   Завершена: {fmt_dt(t['done_at'])}"
         status = due_status(t)
         if status == "overdue":
@@ -575,9 +598,10 @@ class App:
             lt = self.store.get(lid)
             if lt:
                 self._link_ids.append(lid)
-                self.links_list.insert("end", ("✔ " if lt["done"] else "○ ") + self._path_title(lt)
+                self.links_list.insert("end", self._mark(lt) + self._path_title(lt)
                                        + f"   [{CATEGORIES[lt['category']]}]")
         self._set_form_enabled(True, is_sub=bool(parent))
+        self.fail_btn.configure(state="disabled" if t["failed"] else "normal")
 
     def save_form(self, silent=False):
         """Сохраняет форму, только если что-то реально изменилось.
@@ -703,13 +727,26 @@ class App:
             self.store.set_done(tid, True, report)
         self.refresh_keep()
 
-    def _ask_report(self, t):
-        """Окно с отчётом о завершении. Возвращает текст или None при отмене."""
+    def mark_failed(self):
+        self.save_form()
+        tid = self.current_id
+        t = self.store.get(tid) if tid else None
+        if not t or t["failed"]:
+            return
+        report = self._ask_report(t, failed=True)
+        if report is None:  # нажали «Отмена»
+            return
+        self.store.set_failed(tid, report)
+        self.refresh_keep()
+
+    def _ask_report(self, t, failed=False):
+        """Окно с отчётом о завершении (или причиной провала). Возвращает текст или None при отмене."""
         win = tk.Toplevel(self.root)
-        win.title("Завершение задачи")
+        win.title("Провал задачи" if failed else "Завершение задачи")
         win.transient(self.root)
-        ttk.Label(win, text=f"Задача «{t['title']}» выполнена!\nОтчёт (можно оставить пустым):",
-                  padding=10).pack(anchor="w")
+        heading = (f"Задача «{t['title']}» провалена.\nПричина, выводы (можно оставить пустым):" if failed
+                   else f"Задача «{t['title']}» выполнена!\nОтчёт (можно оставить пустым):")
+        ttk.Label(win, text=heading, padding=10).pack(anchor="w")
         text = tk.Text(win, wrap="word", height=8)
         text.pack(fill="both", expand=True, padx=10)
         text.insert("1.0", t["report"])
@@ -722,7 +759,7 @@ class App:
 
         bar = ttk.Frame(win, padding=10)
         bar.pack(side="bottom", fill="x", before=text)  # кнопки занимают место первыми и не обрезаются
-        ttk.Button(bar, text="Завершить", command=ok).pack(side="right")
+        ttk.Button(bar, text="Отметить проваленной" if failed else "Завершить", command=ok).pack(side="right")
         ttk.Button(bar, text="Отмена", command=win.destroy).pack(side="right", padx=6)
         self._fit_dialog(win, 460, 300)
         win.grab_set()
@@ -737,6 +774,186 @@ class App:
         need_w, need_h = win.winfo_reqwidth(), win.winfo_reqheight()
         win.minsize(need_w, need_h)
         win.geometry(f"{max(min_w, need_w)}x{max(min_h, need_h)}")
+
+    # ---- отчёт: статистика за период
+    def _stats_alive(self):
+        try:
+            return self._stats_win is not None and self._stats_win.winfo_exists()
+        except tk.TclError:
+            return False
+
+    def open_stats(self):
+        if self._stats_alive():
+            self._stats_win.lift()
+            self._render_stats()
+            return
+        win = tk.Toplevel(self.root)
+        self._stats_win = win
+        win.title("Отчёт по задачам")
+        win.transient(self.root)
+        win.configure(bg=self.pal["bg"])
+        self._stats_kind = tk.StringVar(value="Месяц")
+        self._stats_offset = 0
+        self._stats_subs = tk.BooleanVar(value=False)
+        self._stats_num = {}
+        self._stats = None
+
+        body = ttk.Frame(win, padding=14)
+        body.pack(fill="both", expand=True)
+        # нижняя панель создаётся первой, чтобы кнопка «Закрыть» никогда не обрезалась
+        bottom = ttk.Frame(body)
+        bottom.pack(side="bottom", fill="x", pady=(10, 0))
+        ttk.Button(bottom, text="Закрыть", command=win.destroy).pack(side="right")
+        ttk.Label(bottom, wraplength=480, foreground=self.pal["muted"], justify="left",
+                  text="В период задача попадает по дедлайну; если дедлайна нет — по дате закрытия "
+                       "(для закрытых) или по дате создания (для открытых).").pack(side="left", fill="x", expand=True)
+
+        ctl = ttk.Frame(body)
+        ctl.pack(fill="x")
+        ttk.Label(ctl, text="Период:").pack(side="left")
+        kinds = ttk.Combobox(ctl, textvariable=self._stats_kind, values=[n for n, _ in STATS_KINDS],
+                             state="readonly", width=10)
+        kinds.pack(side="left", padx=6)
+        kinds.bind("<<ComboboxSelected>>", lambda e: self._stats_shift(0, reset=True))
+        self._stats_prev = ttk.Button(ctl, text="◀", width=3, command=lambda: self._stats_shift(-1))
+        self._stats_prev.pack(side="left")
+        self._stats_label = ttk.Label(ctl, font=self.font_title, anchor="center", width=24)
+        self._stats_label.pack(side="left", padx=6)
+        self._stats_next = ttk.Button(ctl, text="▶", width=3, command=lambda: self._stats_shift(1))
+        self._stats_next.pack(side="left")
+        ttk.Checkbutton(ctl, text="Считать подзадачи", variable=self._stats_subs,
+                        command=self._render_stats).pack(side="right")
+
+        nums = ttk.Frame(body)
+        nums.pack(fill="x", pady=(14, 6))
+        for col, (key, title) in enumerate((("total", "Всего"), ("done", "Выполнено"),
+                                            ("failed", "Провалено"), ("open", "В работе"))):
+            nums.columnconfigure(col, weight=1, uniform="stat")
+            cell = ttk.Frame(nums)
+            cell.grid(row=0, column=col, sticky="ew")
+            number = ttk.Label(cell, text="0", font=self.font_header)
+            number.pack()
+            ttk.Label(cell, text=title).pack()
+            pct = ttk.Label(cell, text="")
+            pct.pack()
+            self._stats_num[key] = (number, pct)
+
+        self._stats_bar = tk.Canvas(body, height=18, highlightthickness=0, bd=0, bg=self.pal["bg"])
+        self._stats_bar.pack(fill="x", pady=(2, 6))
+        self._stats_bar.bind("<Configure>", lambda e: self._draw_stats_bar())
+        self._stats_info = ttk.Label(body, text="", wraplength=600, justify="left")
+        self._stats_info.pack(anchor="w")
+
+        ttk.Label(body, text="По категориям", font=self.font_title).pack(anchor="w", pady=(12, 2))
+        cats = ttk.Treeview(body, columns=("total", "done", "failed", "open"), height=len(CAT_KEYS) + 1,
+                            selectmode="none")
+        cats.heading("#0", text="Категория")
+        cats.column("#0", width=190)
+        for col, title in (("total", "Всего"), ("done", "Выполнено"), ("failed", "Провалено"), ("open", "В работе")):
+            cats.heading(col, text=title)
+            cats.column(col, width=95, anchor="center")
+        cats.pack(fill="x")
+        self._stats_cats = cats
+
+        ttk.Label(body, text="Проваленные задачи (двойной щелчок — открыть)",
+                  font=self.font_title).pack(anchor="w", pady=(12, 2))
+        wrap = ttk.Frame(body)
+        wrap.pack(fill="both", expand=True)
+        failed = ttk.Treeview(wrap, columns=("date", "reason"), height=6, selectmode="browse")
+        failed.heading("#0", text="Задача")
+        failed.heading("date", text="Дата")
+        failed.heading("reason", text="Причина")
+        failed.column("#0", width=220)
+        failed.column("date", width=90, anchor="center")
+        failed.column("reason", width=300)
+        sb = ttk.Scrollbar(wrap, orient="vertical", command=failed.yview)
+        failed.configure(yscrollcommand=sb.set)
+        failed.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        failed.bind("<Double-Button-1>", self._stats_open_failed)
+        self._stats_failed = failed
+
+        self._render_stats()
+        self._fit_dialog(win, 700, 640)
+
+    def _stats_shift(self, delta, reset=False):
+        self._stats_offset = 0 if reset else self._stats_offset + delta
+        self._render_stats()
+
+    def _render_stats(self):
+        if not self._stats_alive():
+            return
+        kind = dict(STATS_KINDS)[self._stats_kind.get()]
+        start, end, label = period_range(kind, self._stats_offset)
+        self._stats_label.configure(text=label)
+        nav = "disabled" if kind == "all" else "normal"
+        self._stats_prev.configure(state=nav)
+        self._stats_next.configure(state=nav)
+
+        d = compute_report(self.store.tasks.values(), start, end, self._stats_subs.get())
+        self._stats = d
+        total = d["total"]
+        colors = {"done": self.pal["ok"], "failed": self.pal["overdue"]}
+        for key, (number, pct) in self._stats_num.items():
+            number.configure(text=str(d[key]), foreground=colors.get(key, self.pal["fg"]))
+            pct.configure(text="" if key == "total" else (f"{round(100 * d[key] / total)}%" if total else "—"))
+
+        if not total:
+            info = "В этом периоде задач нет."
+        elif d["success_rate"] is None:
+            info = "Закрытых задач в этом периоде пока нет."
+        else:
+            info = (f"Успешность: {d['success_rate']}% — выполнено {d['done']} "
+                    f"из {d['done'] + d['failed']} закрытых.")
+        if d["overdue"]:
+            info += f"  Просрочено в работе: {d['overdue']}."
+        self._stats_info.configure(text=info)
+
+        cats = self._stats_cats
+        cats.delete(*cats.get_children())
+        for key in CAT_KEYS:
+            c = d["by_category"][key]
+            cats.insert("", "end", iid=key, text=CATEGORIES[key],
+                        values=(c["total"], c["done"], c["failed"], c["open"]))
+        cats.insert("", "end", iid="_total", text="Итого",
+                    values=(total, d["done"], d["failed"], d["open"]))
+
+        failed = self._stats_failed
+        failed.delete(*failed.get_children())
+        for t in d["failed_tasks"]:
+            when = datetime.fromisoformat(t["done_at"]).astimezone().strftime("%d.%m.%Y") if t["done_at"] else ""
+            reason = " ".join(t["report"].split())
+            if len(reason) > 90:
+                reason = reason[:89] + "…"
+            failed.insert("", "end", iid=t["id"], text=self._path_title(t), values=(when, reason))
+        self._draw_stats_bar()
+
+    def _draw_stats_bar(self):
+        """Полоса: зелёное — выполнено, красное — провалено, серое — в работе."""
+        d = getattr(self, "_stats", None)
+        if not d or not self._stats_alive():
+            return
+        c = self._stats_bar
+        c.delete("all")
+        width, height = c.winfo_width(), 18
+        if width <= 1:
+            return
+        total = d["total"]
+        if not total:
+            c.create_rectangle(0, 0, width, height, fill=self.pal["border"], outline="")
+            return
+        x = 0.0
+        for key, color in (("done", self.pal["ok"]), ("failed", self.pal["overdue"]), ("open", self.pal["border"])):
+            seg = width * d[key] / total
+            if d[key]:
+                c.create_rectangle(x, 0, x + seg, height, fill=color, outline="")
+            x += seg
+
+    def _stats_open_failed(self, _event=None):
+        sel = self._stats_failed.selection()
+        if sel:
+            self.root.deiconify()
+            self.goto(sel[0])
 
     # ---- перенос между категориями
     def _fill_move_menu(self, menu):
