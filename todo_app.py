@@ -16,14 +16,21 @@ from tkinter import font as tkfont
 from tkinter import messagebox, simpledialog, ttk
 
 import gdrive_sync
+from datepicker import pick_date
 from tray import Tray
-from store import (CATEGORIES, REMIND_FMT, TaskStore, compute_report, due_status, fmt_date,
-                   fmt_remind, merge_tasks, parse_date, parse_datetime, period_range)
+from store import (CATEGORIES, MONTHS, REMIND_FMT, TaskStore, closed_date, compute_report, due_status,
+                   fmt_date, fmt_remind, merge_tasks, parse_date, parse_datetime, period_range)
 
 DATA_DIR = Path(os.environ.get("TODO_APP_DIR", Path.home() / ".todo_app"))
 APP_DIR = Path(__file__).resolve().parent
 CAT_KEYS = list(CATEGORIES)
 CAT_NAMES = [CATEGORIES[k] for k in CAT_KEYS]
+ARCHIVE_KEY = "archive"
+TAB_KEYS = CAT_KEYS + [ARCHIVE_KEY]          # вкладки: четыре категории и архив
+TAB_NAMES = {**CATEGORIES, ARCHIVE_KEY: "Архив"}
+DEFAULT_ARCHIVE_DAYS = 1
+ARCHIVE_CHOICES = (("Сразу после завершения", 0), ("На следующий день", 1), ("Через 3 дня", 3),
+                   ("Через неделю", 7), ("Через месяц", 30), ("Никогда", -1))
 REMINDER_CHECK_MS = 30_000
 MAX_REMINDER_WINDOWS = 5
 
@@ -97,6 +104,7 @@ class App:
         self.settings = load_settings()
         self._view_win = None
         self._stats_win = None
+        self._archived = set()  # id основных задач, показываемых во вкладке «Архив»
         self._native_theme = ttk.Style(root).theme_use()
         self._init_fonts()
 
@@ -150,9 +158,9 @@ class App:
         self.nb = ttk.Notebook(left)
         self.nb.pack(fill="both", expand=True)
         self.trees = {}
-        for key in CAT_KEYS:
+        for key in TAB_KEYS:
             frame = ttk.Frame(self.nb)
-            self.nb.add(frame, text=CATEGORIES[key])
+            self.nb.add(frame, text=TAB_NAMES[key])
             tree = ttk.Treeview(frame, show="tree", selectmode="browse")
             sb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
             tree.configure(yscrollcommand=sb.set)
@@ -211,6 +219,7 @@ class App:
         self.due_entry.pack(side="left")
         self.due_entry.bind("<Return>", lambda e: self.save_form())
         self.due_btns = [
+            ttk.Button(drow, text="📅", width=3, command=self.pick_due),
             ttk.Button(drow, text="Сегодня", width=9, command=lambda: self.quick_due(0)),
             ttk.Button(drow, text="Завтра", width=8, command=lambda: self.quick_due(1)),
             ttk.Button(drow, text="+7 дн.", width=7, command=lambda: self.quick_due(7)),
@@ -218,6 +227,7 @@ class App:
         ]
         for b in self.due_btns:
             b.pack(side="left", padx=(4, 0))
+        self.cal_btn = self.due_btns[0]
 
         # напоминание
         rrow = ttk.Frame(right)
@@ -418,6 +428,9 @@ class App:
         v_family = tk.StringVar(value=family)
         v_size = tk.StringVar(value=str(size))
         v_theme = tk.StringVar(value=self.settings.get("theme", "system"))
+        archive_value = dict(ARCHIVE_CHOICES)
+        archive_name = {value: name for name, value in ARCHIVE_CHOICES}
+        v_archive = tk.StringVar(value=archive_name[self._archive_setting()])
         families = sorted({f for f in tkfont.families(self.root) if not f.startswith("@")}, key=str.casefold)
 
         body = ttk.Frame(win, padding=16)
@@ -433,6 +446,12 @@ class App:
         themes.grid(row=2, column=1, sticky="w", padx=(10, 0))
         for text, value in THEME_CHOICES:
             ttk.Radiobutton(themes, text=text, value=value, variable=v_theme).pack(anchor="w", pady=1)
+        ttk.Label(body, text="В архив:").grid(row=3, column=0, sticky="w", pady=(10, 4))
+        ttk.Combobox(body, textvariable=v_archive, values=[name for name, _ in ARCHIVE_CHOICES],
+                     state="readonly", width=32).grid(row=3, column=1, sticky="ew", padx=(10, 0), pady=(10, 0))
+        ttk.Label(body, text="Выполненные и проваленные задачи уходят из категорий во вкладку «Архив».",
+                  foreground=self.pal["muted"], wraplength=380, justify="left"
+                  ).grid(row=4, column=0, columnspan=2, sticky="w")
 
         def changed(*_):
             try:
@@ -441,53 +460,107 @@ class App:
                 return  # пока вводят число
             if not MIN_FONT <= new_size <= MAX_FONT:
                 return
-            self.settings.update(font_family=v_family.get(), font_size=new_size, theme=v_theme.get())
+            self.settings.update(font_family=v_family.get(), font_size=new_size, theme=v_theme.get(),
+                                 archive_days=archive_value[v_archive.get()])
             save_settings(self.settings)
             self.apply_appearance()
+            self.save_form(silent=True)  # правки карточки не должны потеряться при перерисовке списка
+            self.refresh_keep()          # срок архивации мог измениться
 
-        for var in (v_family, v_size, v_theme):
+        for var in (v_family, v_size, v_theme, v_archive):
             var.trace_add("write", changed)
 
         def reset():
             v_family.set(self._default_family)
             v_size.set(str(self._default_size))
             v_theme.set("system")
+            v_archive.set(archive_name[DEFAULT_ARCHIVE_DAYS])
 
         bar = ttk.Frame(body)
-        bar.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+        bar.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(14, 0))
         ttk.Button(bar, text="По умолчанию", command=reset).pack(side="left")
         ttk.Button(bar, text="Закрыть", command=win.destroy).pack(side="right")
 
     # ------------------------------------------------------------ дерево
+    def current_tab(self):
+        return TAB_KEYS[self.nb.index(self.nb.select())]
+
     def current_cat(self):
-        return CAT_KEYS[self.nb.index(self.nb.select())]
+        """Категория для новых задач: активная вкладка, а на вкладке «Архив» — «Сегодня»."""
+        key = self.current_tab()
+        return key if key in CATEGORIES else "today"
 
     def selected_id(self):
-        sel = self.trees[self.current_cat()].selection()
+        sel = self.trees[self.current_tab()].selection()
         return sel[0] if sel else None
+
+    # ---- архив
+    def _archive_setting(self):
+        v = self.settings.get("archive_days", DEFAULT_ARCHIVE_DAYS)
+        valid = {value for _, value in ARCHIVE_CHOICES}
+        return v if (isinstance(v, int) and not isinstance(v, bool) and v in valid) else DEFAULT_ARCHIVE_DAYS
+
+    def _archive_days(self):
+        v = self._archive_setting()
+        return None if v < 0 else v  # None — архив выключен
+
+    def _root_id(self, t):
+        for _ in range(100):  # защита от битых данных с циклом
+            parent = self.store.tasks.get(t["parent_id"]) if t["parent_id"] else None
+            if parent is None:
+                break
+            t = parent
+        return t["id"]
+
+    def _tab_for(self, t):
+        """Вкладка, на которой сейчас показывается задача."""
+        return ARCHIVE_KEY if self._root_id(t) in self._archived else t["category"]
 
     def refresh(self):
         self._loading = True
         visible = self.store.search(self.q_var.get(), self.hide_done_var.get())
         self._visible = visible
+        self._archived = self.store.archived_ids(self._archive_days())
         alive = self.store.alive()
         for i, key in enumerate(CAT_KEYS):
             tree = self.trees[key]
             tree.delete(*tree.get_children())
-            for t in self.store.roots(key):
+            for t in self.store.roots(key, exclude=self._archived):
                 self._insert(tree, "", t)
             in_cat = [t for t in alive if t["category"] == key and (visible is None or t["id"] in visible)]
             left = sum(1 for t in in_cat if not t["done"])
             overdue = sum(1 for t in in_cat if due_status(t) == "overdue")
             label = f"{CATEGORIES[key]} ({left})" + (f" ⚠{overdue}" if overdue else "")
             self.nb.tab(i, text=label)
+
+        # архив: закрытые задачи, сгруппированные по месяцу закрытия
+        tree = self.trees[ARCHIVE_KEY]
+        tree.delete(*tree.get_children())
+        groups = {}
+        for t in self.store.archive_roots(self._archived):
+            if visible is not None and t["id"] not in visible:
+                continue
+            cd = closed_date(t)
+            groups.setdefault((cd.year, cd.month) if cd else (0, 0), []).append(t)
+        shown = 0
+        for (y, m), items in sorted(groups.items(), reverse=True):
+            header = f"month:{y}-{m}"  # заголовок месяца: не задача, выбрать его нельзя в смысле карточки
+            tree.insert("", "end", iid=header, open=True,
+                        text=(f"{MONTHS[m - 1]} {y}" if y else "Без даты") + f"  ({len(items)})")
+            for t in items:
+                self._insert(tree, header, t, archive=True)
+            shown += len(items)
+        self.nb.tab(len(CAT_KEYS), text=f"Архив ({shown})")
         self._loading = False
         self._render_stats()  # если окно отчёта открыто — обновить цифры
 
-    def _insert(self, tree, parent, t):
+    def _insert(self, tree, parent, t, archive=False):
         if self._visible is not None and t["id"] not in self._visible:
             return
         text = self._mark(t) + t["title"]
+        if archive:
+            cd = closed_date(t)
+            text += f"   · {CATEGORIES[t['category']]}" + (f", {cd:%d.%m.%y}" if cd else "")
         if t["due"]:
             text += f"   📅 {short_date(t['due'])}"
         if t["remind"] and not t["reminded"] and not t["done"]:
@@ -513,12 +586,14 @@ class App:
         t = self.store.get(tid)
         if not t:
             return
-        tree = self.trees[t["category"]]
+        tree = self.trees[self._tab_for(t)]
         if not tree.exists(tid):
             if not clear_filter:
                 return
             self._clear_filter()  # задача скрыта поиском — сбрасываем фильтр
-        self.nb.select(CAT_KEYS.index(t["category"]))
+        key = self._tab_for(t)  # после сброса фильтра архив мог измениться
+        tree = self.trees[key]
+        self.nb.select(TAB_KEYS.index(key))
         tree.selection_set(tid)
         tree.focus(tid)
         tree.see(tid)
@@ -534,7 +609,13 @@ class App:
         cur = self.current_id
         self.refresh()
         t = self.store.get(cur) if cur else None
-        if t and self.trees[t["category"]].exists(cur):
+        if t:
+            key = self._tab_for(t)
+            if key == ARCHIVE_KEY and self.current_tab() != ARCHIVE_KEY:
+                t = None  # задачу только что убрали в архив: на текущей вкладке её больше нет
+            elif not self.trees[key].exists(cur):
+                t = None  # скрыта поиском
+        if t:
             self.goto(cur, clear_filter=False)
             self.load_form(cur)
         else:
@@ -657,6 +738,23 @@ class App:
             return
         self.due_var.set("" if days is None else fmt_date((date.today() + timedelta(days=days)).isoformat()))
         self.save_form()
+
+    def pick_due(self):
+        """Календарь для выбора дедлайна; прошедшие дни недоступны."""
+        if not self.current_id:
+            return
+        initial = None
+        try:
+            iso = parse_date(self.due_var.get())
+            initial = date.fromisoformat(iso) if iso else None
+        except ValueError:
+            pass  # в поле пока не дата — календарь откроется на текущем месяце
+        pick_date(self.root, self.cal_btn, initial, date.today(), self.pal, self._on_due_picked)
+
+    def _on_due_picked(self, day):
+        if self.current_id:
+            self.due_var.set(fmt_date(day.isoformat()))
+            self.save_form()
 
     def quick_remind(self, hours=None, tomorrow_9=False):
         if not self.current_id:

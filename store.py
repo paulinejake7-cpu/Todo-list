@@ -184,6 +184,13 @@ def compute_report(tasks, start, end, include_subtasks=False, today: date | None
     return res
 
 
+def closed_date(t: dict) -> date | None:
+    """Локальная дата закрытия задачи (выполнена или провалена); для открытых None."""
+    if not t["done"] or not t.get("done_at"):
+        return None
+    return datetime.fromisoformat(t["done_at"]).astimezone().date()
+
+
 def merge_tasks(local: dict, remote: dict) -> dict:
     """Слияние двух наборов задач: для каждой задачи побеждает более новая правка.
     Удалённые задачи хранятся как «надгробия» (deleted=True), чтобы удаление тоже синхронизировалось."""
@@ -237,11 +244,50 @@ class TaskStore:
         # невыполненные выше; внутри — по сроку (без срока — в конце), затем по дате создания
         return (t["done"], t["due"] or "9999-12-31", t["created"])
 
-    def roots(self, category):
+    def roots(self, category, exclude=frozenset()):
         return sorted(
-            (t for t in self.alive() if t["parent_id"] is None and t["category"] == category),
+            (t for t in self.alive()
+             if t["parent_id"] is None and t["category"] == category and t["id"] not in exclude),
             key=self._order,
         )
+
+    # ---------- архив ----------
+    def archived_ids(self, days, today: date | None = None) -> set:
+        """id основных задач, которые пора показывать в архиве, а не в категориях.
+        Задача уходит в архив, если она закрыта (выполнена или провалена), с даты закрытия прошло
+        не меньше `days` календарных дней (0 — сразу; 1 — на следующий день) и все её подзадачи
+        тоже закрыты (иначе открытые подзадачи пропали бы из списка). days=None — архив отключён.
+        Сами данные не меняются: это только способ показа, поэтому «вернуть в работу» достаёт задачу обратно."""
+        if days is None:
+            return set()
+        today = today or date.today()
+        alive = self.alive()
+        kids: dict = {}
+        for t in alive:
+            if t["parent_id"]:
+                kids.setdefault(t["parent_id"], []).append(t)
+        out = set()
+        for t in alive:
+            if t["parent_id"] is not None or not t["done"]:
+                continue
+            cd = closed_date(t)
+            if cd is None or (today - cd).days < days:
+                continue
+            stack, all_closed = list(kids.get(t["id"], ())), True
+            while stack:
+                c = stack.pop()
+                if not c["done"]:
+                    all_closed = False
+                    break
+                stack.extend(kids.get(c["id"], ()))
+            if all_closed:
+                out.add(t["id"])
+        return out
+
+    def archive_roots(self, archived_ids):
+        """Архивные задачи, самые свежие сверху."""
+        return sorted((self.tasks[i] for i in archived_ids if i in self.tasks),
+                      key=lambda t: t["done_at"] or "", reverse=True)
 
     def children(self, tid):
         return sorted((t for t in self.alive() if t["parent_id"] == tid), key=self._order)
